@@ -21,6 +21,7 @@ export interface LLMConfig {
   api_key: string;
   api_base: string | null;
   reasoning_effort: ReasoningEffort | null;
+  timeout_seconds: number | null;
 }
 
 export interface LLMConfigUpdate {
@@ -30,6 +31,7 @@ export interface LLMConfigUpdate {
   api_base?: string | null;
   // Pass '' (empty string) to clear; null is ignored by the server.
   reasoning_effort?: ReasoningEffort | '' | null;
+  timeout_seconds?: number | null;
 }
 
 export interface DatabaseStats {

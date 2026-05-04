@@ -108,6 +108,7 @@ async def get_llm_config_endpoint() -> LLMConfigResponse:
         api_key=_mask_api_key(resolve_api_key(stored, provider)),
         api_base=stored.get("api_base", settings.llm_api_base),
         reasoning_effort=reasoning_effort or None,
+        timeout_seconds=stored.get("timeout_seconds"),
     )
 
 
@@ -140,6 +141,8 @@ async def update_llm_config(
         # Persist empty string on clear so the gpt-5 auto-migration doesn't
         # re-fire on next get_llm_config() call.
         stored["reasoning_effort"] = request.reasoning_effort
+    if request.timeout_seconds is not None:
+        stored["timeout_seconds"] = request.timeout_seconds
 
     # Build normalized config for response and background health check
     resolved_provider = stored.get("provider", settings.llm_provider)
@@ -165,6 +168,7 @@ async def update_llm_config(
         api_key=_mask_api_key(test_config.api_key),
         api_base=test_config.api_base,
         reasoning_effort=test_config.reasoning_effort,
+        timeout_seconds=stored.get("timeout_seconds"),
     )
 
 
