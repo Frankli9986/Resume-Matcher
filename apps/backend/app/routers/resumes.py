@@ -507,6 +507,15 @@ ALLOWED_TYPES = {
 }
 MAX_FILE_SIZE = 4 * 1024 * 1024  # 4MB
 
+# Concurrency cap for the long-running improve/preview path. Pairs with the
+# 1-hour outer timeout to bound resource usage: even though a single tailoring
+# call may legitimately take many minutes (large local LLM, slow Ollama host),
+# we never let more than N of them run at once. This is the compensating
+# control for the long timeout — if the host is busy, additional callers are
+# rejected fast with 503 instead of stacking up and exhausting workers.
+IMPROVE_PREVIEW_MAX_CONCURRENCY = 4
+_improve_preview_semaphore = asyncio.Semaphore(IMPROVE_PREVIEW_MAX_CONCURRENCY)
+
 
 @router.post("/upload", response_model=ResumeUploadResponse)
 async def upload_resume(file: UploadFile = File(...)) -> ResumeUploadResponse:
@@ -689,41 +698,68 @@ async def improve_resume_preview_endpoint(
     language = get_content_language()
     prompt_id = request.prompt_id or _get_default_prompt_id()
 
-    stage = "load_job_keywords"
-    detail = "Failed to preview resume. Please try again."
+    # Reject fast when the host is already saturated, instead of blocking on
+    # the semaphore for up to an hour. This is the DoS guard that pairs with
+    # the long inner timeout: at most IMPROVE_PREVIEW_MAX_CONCURRENCY tailoring
+    # jobs run concurrently per process; further callers see 503 immediately
+    # and can retry later. asyncio.Semaphore lacks a non-blocking try-acquire,
+    # so we simulate one with wait_for(..., timeout=0).
     try:
-        return await asyncio.wait_for(
-            _improve_preview_flow(
-                request=request,
-                resume=resume,
-                job=job,
-                language=language,
-                prompt_id=prompt_id,
-            ),
-            timeout=3600.0,  # 1-hour hard limit; inner LLM timeouts (from Settings) are shorter
-        )
+        await asyncio.wait_for(_improve_preview_semaphore.acquire(), timeout=0)
     except asyncio.TimeoutError:
-        logger.error(
-            "Improve preview timed out after 3600s for resume %s / job %s",
-            request.resume_id,
-            request.job_id,
-        )
-        raise HTTPException(
-            status_code=504,
-            detail="Resume tailoring timed out. Please try again with a shorter job description or a simpler prompt.",
-        )
-    except asyncio.CancelledError:
         logger.warning(
-            "Improve preview cancelled for resume %s / job %s (client disconnected)",
+            "Improve preview rejected (busy) for resume %s / job %s",
             request.resume_id,
             request.job_id,
         )
         raise HTTPException(
-            status_code=499,
-            detail="Request was cancelled. The server may still be processing.",
+            status_code=503,
+            detail=(
+                f"Server is busy tailoring other resumes "
+                f"(max {IMPROVE_PREVIEW_MAX_CONCURRENCY} concurrent). "
+                "Please retry in a moment."
+            ),
         )
-    except Exception as e:
-        _raise_improve_error("preview", stage, e, detail)
+
+    # Slot acquired — release it on every exit path below.
+    try:
+        stage = "load_job_keywords"
+        detail = "Failed to preview resume. Please try again."
+        try:
+            return await asyncio.wait_for(
+                _improve_preview_flow(
+                    request=request,
+                    resume=resume,
+                    job=job,
+                    language=language,
+                    prompt_id=prompt_id,
+                ),
+                timeout=3600.0,  # 1-hour hard limit; inner LLM timeouts (from Settings) are shorter
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Improve preview timed out after 3600s for resume %s / job %s",
+                request.resume_id,
+                request.job_id,
+            )
+            raise HTTPException(
+                status_code=504,
+                detail="Resume tailoring timed out. Please try again with a shorter job description or a simpler prompt.",
+            )
+        except asyncio.CancelledError:
+            logger.warning(
+                "Improve preview cancelled for resume %s / job %s (client disconnected)",
+                request.resume_id,
+                request.job_id,
+            )
+            raise HTTPException(
+                status_code=499,
+                detail="Request was cancelled. The server may still be processing.",
+            )
+        except Exception as e:
+            _raise_improve_error("preview", stage, e, detail)
+    finally:
+        _improve_preview_semaphore.release()
 
 
 async def _improve_preview_flow(
