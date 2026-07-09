@@ -141,8 +141,11 @@ async def update_llm_config(
         # Persist empty string on clear so the gpt-5 auto-migration doesn't
         # re-fire on next get_llm_config() call.
         stored["reasoning_effort"] = request.reasoning_effort
-    if request.timeout_seconds is not None:
-        stored["timeout_seconds"] = request.timeout_seconds
+    # Use exclude_unset so an explicit `null` can clear the persisted value
+    # while omitting the field leaves it unchanged.
+    payload = request.model_dump(exclude_unset=True)
+    if "timeout_seconds" in payload:
+        stored["timeout_seconds"] = payload["timeout_seconds"]
 
     # Build normalized config for response and background health check
     resolved_provider = stored.get("provider", settings.llm_provider)
