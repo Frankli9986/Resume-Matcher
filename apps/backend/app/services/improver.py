@@ -1291,44 +1291,52 @@ def _match_bullets(
             matches.append(_BulletMatch(i, j, 1.0, True))
         return sorted(matches, key=lambda m: (m.new_index, m.old_index))
 
-    # Score every candidate pair that clears the threshold. Empty token lists
-    # (bullets that normalize to nothing, e.g. pure punctuation) never match.
+    # Score every candidate pair that clears the threshold. Identical
+    # normalized source (incl. pure-punctuation bullets whose token list is
+    # empty) is an exact match in BOTH the fuzzy and the fast path, so
+    # identical "---" produces no diff. The empty-token skip below guards only
+    # fuzzy scoring, never the exact check - otherwise identical pure-
+    # punctuation bullets would be swallowed into add/remove in the fuzzy path
+    # only, diverging from the fast path (architect alignment on RM#905).
     candidates: list[tuple[float, bool, int, int, int]] = []
     for i, left in enumerate(old_tokens):
-        if not left:
-            continue
         for j, right in enumerate(new_tokens):
-            if not right:
-                continue
-            if old_norm[i] == new_norm[j] and old_norm[i]:
+            if old_norm[i] and old_norm[i] == new_norm[j]:
                 # Identical normalized source (punctuation included) -> exact,
-                # i.e. a pure reorder or a no-op rewrite.
+                # i.e. a pure reorder or a no-op rewrite. Applies to ALL
+                # bullets including empty-token (pure punctuation) ones, so
+                # identical "---" yields no diff - matching the fast path.
                 score = 1.0
                 exact = True
+            elif not left or not right:
+                # Empty token lists (pure punctuation) have no similarity to
+                # score. Only identical ones (caught above) match; distinct
+                # ones fall through to add/remove.
+                continue
+            elif left == right:
+                # Tokens match but normalized source differs: a
+                # punctuation-only edit such as "C++" -> "C#" (both
+                # tokenize to ["c"]). A real content change - score 1.0 so
+                # it pairs and emits as `modified`, not suppressed (cubic
+                # review on RM#905).
+                score = 1.0
+                exact = False
             else:
                 exact = False
-                if left == right:
-                    # Tokens match but normalized source differs: a
-                    # punctuation-only edit such as "C++" -> "C#" (both
-                    # tokenize to ["c"]). A real content change - score 1.0 so
-                    # it pairs and emits as `modified`, not suppressed (cubic
-                    # review on RM#905).
-                    score = 1.0
-                else:
-                    token_ratio = SequenceMatcher(
-                        None, left, right, autojunk=False
-                    ).ratio()
-                    # Char-level ratio catches single-word edits on short
-                    # bullets ("Led team" -> "Led squad") that would otherwise
-                    # score 0.5 on tokens and get dropped as unrelated. Use the
-                    # normalized text so casing/whitespace don't distort it.
-                    char_ratio = SequenceMatcher(
-                        None,
-                        " ".join(left),
-                        " ".join(right),
-                        autojunk=False,
-                    ).ratio()
-                    score = max(token_ratio, char_ratio)
+                token_ratio = SequenceMatcher(
+                    None, left, right, autojunk=False
+                ).ratio()
+                # Char-level ratio catches single-word edits on short
+                # bullets ("Led team" -> "Led squad") that would otherwise
+                # score 0.5 on tokens and get dropped as unrelated. Use the
+                # normalized text so casing/whitespace don't distort it.
+                char_ratio = SequenceMatcher(
+                    None,
+                    " ".join(left),
+                    " ".join(right),
+                    autojunk=False,
+                ).ratio()
+                score = max(token_ratio, char_ratio)
             if exact or score >= threshold:
                 # tuple: (-score, not exact, |i-j|, i, j) so sort() gives us
                 # highest score first, exact matches before fuzzy at same

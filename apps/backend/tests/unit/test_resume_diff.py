@@ -390,6 +390,42 @@ def test_whitespace_only_difference_is_not_a_content_change() -> None:
     assert _describe("workExperience[0].description", original, improved) == []
 
 
+def test_identical_pure_punctuation_is_no_diff_in_fuzzy_path() -> None:
+    # Architect alignment on RM#905: identical normalized source (incl. pure
+    # punctuation, whose token list is empty) must be an exact match in the
+    # fuzzy path too. Previously the empty-token skip ran first and swallowed
+    # identical "---" into add/remove only here, diverging from the fast path.
+    assert _describe("workExperience[0].description", ["---"], ["---"]) == []
+    assert _describe(
+        "workExperience[0].description",
+        ["---", "---", "---"],
+        ["---", "---", "---"],
+    ) == []
+
+
+def test_identical_pure_punctuation_is_no_diff_in_fast_path() -> None:
+    # Same invariant under the >100 fast path: an unchanged large list with a
+    # trailing pure-punctuation bullet produces no diff (guards against the two
+    # paths drifting apart again).
+    original = [f"Item {i}" for i in range(120)] + ["---"]
+    improved = [f"Item {i}" for i in range(120)] + ["---"]
+
+    assert _describe("wp", original, improved) == []
+
+
+def test_distinct_pure_punctuation_splits_into_add_remove() -> None:
+    # Distinct pure-punctuation bullets have no token similarity, so they must
+    # NOT pair as a modified edit - they split into add/remove. Checked in both
+    # the fuzzy and the fast path so the two stay consistent.
+    fuzzy = _describe("workExperience[0].description", ["---"], ["***"])
+    assert sorted(c.change_type for c in fuzzy) == ["added", "removed"]
+
+    original = [f"Item {i}" for i in range(120)] + ["---"]
+    improved = [f"Item {i}" for i in range(120)] + ["***"]
+    fast = _describe("wp", original, improved)
+    assert sorted(c.change_type for c in fast) == ["added", "removed"]
+
+
 def test_pure_reorder_produces_no_records_in_pr1() -> None:
     # PR-1 does not ship the `moved` enum: pure reorders must be silent so
     # the existing frontend does not receive an unknown change_type.
