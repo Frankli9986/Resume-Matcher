@@ -1143,6 +1143,184 @@ def _extract_description_list(entry: Any) -> list[str]:
     return _normalize_string_list(entry.get("description", []), "workExperience.description")
 
 
+# Similarity-based bullet matching (RM #711 PR-1).
+#
+# The previous implementation ran SequenceMatcher over whole bullet strings as
+# atomic tokens, so `[A, B, C] -> [C, A, B]` produced a `replace` opcode that
+# paired unrelated bullets by position and reported them as `modified`. We now:
+#
+#   1. Tokenize each bullet at the WORD level (unicode-aware, CJK per-char).
+#   2. Score every (old, new) pair with SequenceMatcher.ratio() over the
+#      normalized token lists — exact normalized matches short-circuit to 1.0.
+#   3. Greedily pick highest-score pairs one-to-one until nothing remains that
+#      clears MATCH_THRESHOLD.
+#   4. Emit `modified` for content-changing pairs; emit `moved` only when
+#      `emit_moves=True` AND the pair is a pure reorder (contract shipped in
+#      PR-2). Unpaired items become `added` / `removed`.
+#
+# PR-1 keeps `emit_moves=False` by default so this ships without touching the
+# frontend/`change_type` enum contract; pure reorders are silently suppressed
+# (previous behaviour also did not emit them).
+
+# Default similarity threshold: values below this are treated as unrelated and
+# split into add/remove instead of forcing a bogus `modified` pair.
+#
+# Bullets are scored with max(token_ratio, char_ratio) so single-word edits on
+# short bullets (e.g. "Led team" -> "Led squad", token ratio 0.5 but char ratio
+# ~0.75) still cross the threshold, while genuinely unrelated bullets from the
+# issue-#711 LCS trap (e.g. "React form" vs "BackstopJS") stay well below it.
+_DEFAULT_MATCH_THRESHOLD: float = 0.55
+
+# Bullet count above which we skip the O(n*m) scoring pass and only pair on
+# exact normalized keys. Resume descriptions rarely exceed a few dozen bullets;
+# this cap is a defensive backstop for adversarial input.
+_FUZZY_MATCH_LIMIT: int = 100
+
+
+def _tokenize_for_similarity(text: str) -> list[str]:
+    """Return the normalized word/char token list used for similarity scoring.
+
+    - NFKC normalization + casefold makes width/case/compat forms equivalent.
+    - Latin runs (letters+digits) collapse into single word tokens; CJK
+      characters become one token each so we do not depend on whitespace in
+      languages that lack it.
+    - Whitespace is collapsed away; punctuation is dropped from the token
+      stream (it still lives in the original string used for rendering).
+    """
+    import unicodedata
+
+    normalized = unicodedata.normalize("NFKC", text or "").casefold()
+    tokens: list[str] = []
+    buffer: list[str] = []
+    for ch in normalized:
+        # CJK Unified Ideographs, Hiragana, Katakana, Hangul: one token each.
+        if (
+            "぀" <= ch <= "ヿ"
+            or "㐀" <= ch <= "鿿"
+            or "가" <= ch <= "힯"
+            or "豈" <= ch <= "﫿"
+        ):
+            if buffer:
+                tokens.append("".join(buffer))
+                buffer.clear()
+            tokens.append(ch)
+            continue
+        if ch.isalnum():
+            buffer.append(ch)
+        else:
+            if buffer:
+                tokens.append("".join(buffer))
+                buffer.clear()
+    if buffer:
+        tokens.append("".join(buffer))
+    return tokens
+
+
+@dataclass(frozen=True)
+class _BulletMatch:
+    old_index: int
+    new_index: int
+    score: float
+    exact: bool  # True iff normalized token lists are identical.
+
+
+def _match_bullets(
+    original_items: list[str],
+    improved_items: list[str],
+    threshold: float,
+) -> list[_BulletMatch]:
+    """One-to-one greedy pairing by token-level similarity.
+
+    Returns matches sorted by new_index for stable downstream rendering.
+    Uses deterministic tie-breaks so identical input always yields identical
+    output — required for reproducible diffs and snapshot tests.
+    """
+    old_tokens = [_tokenize_for_similarity(x) for x in original_items]
+    new_tokens = [_tokenize_for_similarity(x) for x in improved_items]
+
+    # Fast path: purely add/remove — nothing to match against.
+    if not old_tokens or not new_tokens:
+        return []
+
+    # Defensive backstop for adversarial input: skip fuzzy scoring above the
+    # limit, keep only exact anchors. See _FUZZY_MATCH_LIMIT.
+    if max(len(old_tokens), len(new_tokens)) > _FUZZY_MATCH_LIMIT:
+        matches: list[_BulletMatch] = []
+        used_new: set[int] = set()
+        for i, left in enumerate(old_tokens):
+            for j, right in enumerate(new_tokens):
+                if j in used_new or left != right or not left:
+                    continue
+                matches.append(_BulletMatch(i, j, 1.0, True))
+                used_new.add(j)
+                break
+        return sorted(matches, key=lambda m: (m.new_index, m.old_index))
+
+    # Score every candidate pair that clears the threshold. Empty token lists
+    # (bullets that normalize to nothing, e.g. pure punctuation) never match.
+    candidates: list[tuple[float, bool, int, int, int]] = []
+    for i, left in enumerate(old_tokens):
+        if not left:
+            continue
+        for j, right in enumerate(new_tokens):
+            if not right:
+                continue
+            if left == right:
+                score = 1.0
+                exact = True
+            else:
+                token_ratio = SequenceMatcher(
+                    None, left, right, autojunk=False
+                ).ratio()
+                # Char-level ratio catches single-word edits on short bullets
+                # ("Led team" -> "Led squad") that would otherwise score 0.5 on
+                # tokens and get dropped as unrelated. Use the normalized text
+                # so casing/whitespace don't distort it.
+                char_ratio = SequenceMatcher(
+                    None,
+                    " ".join(left),
+                    " ".join(right),
+                    autojunk=False,
+                ).ratio()
+                score = max(token_ratio, char_ratio)
+                exact = False
+            if exact or score >= threshold:
+                # tuple: (-score, not exact, |i-j|, i, j) so sort() gives us
+                # highest score first, exact matches before fuzzy at same
+                # score, and closer indices before farther on ties.
+                candidates.append((score, exact, abs(i - j), i, j))
+
+    candidates.sort(key=lambda c: (-c[0], not c[1], c[2], c[3], c[4]))
+
+    used_old: set[int] = set()
+    used_new: set[int] = set()
+    matches = []
+    for score, exact, _distance, i, j in candidates:
+        if i in used_old or j in used_new:
+            continue
+        used_old.add(i)
+        used_new.add(j)
+        matches.append(_BulletMatch(i, j, score, exact))
+
+    return sorted(matches, key=lambda m: (m.new_index, m.old_index))
+
+
+def _confidence_for_score(
+    score: float, confidences: DiffConfidence
+) -> str:
+    """Map a similarity score onto the string confidence tiers.
+
+    High score -> high confidence the two bullets are related edits of each
+    other. Anything at/above 0.85 is high; 0.65-0.85 keeps the caller's default
+    (usually medium); below 0.65 downgrades to low so the UI can flag it.
+    """
+    if score >= 0.85:
+        return "high"
+    if score >= 0.65:
+        return confidences.modified
+    return "low"
+
+
 def _append_list_changes(
     changes: list[ResumeFieldDiff],
     field_path: str,
@@ -1150,75 +1328,74 @@ def _append_list_changes(
     original_items: list[str],
     improved_items: list[str],
     confidences: DiffConfidence,
+    *,
+    match_threshold: float = _DEFAULT_MATCH_THRESHOLD,
+    emit_moves: bool = False,
 ) -> None:
-    matcher = SequenceMatcher(a=original_items, b=improved_items, autojunk=False)
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
+    """Append ResumeFieldDiff records for a pair of bullet lists.
+
+    See module-level comment above the function for the algorithm.
+    """
+    matches = _match_bullets(original_items, improved_items, match_threshold)
+    matched_old = {m.old_index for m in matches}
+    matched_new = {m.new_index for m in matches}
+
+    # 1. Pairs first — either `modified` for edited content or (PR-2) `moved`
+    #    for pure reorders. Pure reorders are silently dropped in PR-1 because
+    #    the current `change_type` Literal does not include "moved".
+    for match in matches:
+        original_value = original_items[match.old_index]
+        new_value = improved_items[match.new_index]
+        if match.exact:
+            if match.old_index != match.new_index and emit_moves:
+                # PR-2 will land the `moved` enum; guarded so it's a no-op today.
+                changes.append(
+                    ResumeFieldDiff(
+                        field_path=field_path,
+                        field_type=field_type,
+                        change_type="moved",  # type: ignore[arg-type]
+                        original_value=original_value,
+                        new_value=new_value,
+                        confidence="high",
+                    )
+                )
             continue
-        if tag == "delete":
-            for item in original_items[i1:i2]:
-                changes.append(
-                    ResumeFieldDiff(
-                        field_path=field_path,
-                        field_type=field_type,
-                        change_type="removed",
-                        original_value=item,
-                        confidence=confidences.removed,
-                    )
+        changes.append(
+            ResumeFieldDiff(
+                field_path=field_path,
+                field_type=field_type,
+                change_type="modified",
+                original_value=original_value,
+                new_value=new_value,
+                confidence=_confidence_for_score(match.score, confidences),
+            )
+        )
+
+    # 2. Unmatched improved items become `added` in their new-order position.
+    for j, item in enumerate(improved_items):
+        if j not in matched_new:
+            changes.append(
+                ResumeFieldDiff(
+                    field_path=field_path,
+                    field_type=field_type,
+                    change_type="added",
+                    new_value=item,
+                    confidence=confidences.added,
                 )
-        elif tag == "insert":
-            for item in improved_items[j1:j2]:
-                changes.append(
-                    ResumeFieldDiff(
-                        field_path=field_path,
-                        field_type=field_type,
-                        change_type="added",
-                        new_value=item,
-                        confidence=confidences.added,
-                    )
+            )
+
+    # 3. Unmatched original items become `removed`.
+    for i, item in enumerate(original_items):
+        if i not in matched_old:
+            changes.append(
+                ResumeFieldDiff(
+                    field_path=field_path,
+                    field_type=field_type,
+                    change_type="removed",
+                    original_value=item,
+                    confidence=confidences.removed,
                 )
-        elif tag == "replace":
-            original_segment = original_items[i1:i2]
-            improved_segment = improved_items[j1:j2]
-            segment_len = max(len(original_segment), len(improved_segment))
-            for offset in range(segment_len):
-                original_value = (
-                    original_segment[offset] if offset < len(original_segment) else None
-                )
-                new_value = (
-                    improved_segment[offset] if offset < len(improved_segment) else None
-                )
-                if original_value is not None and new_value is not None:
-                    changes.append(
-                        ResumeFieldDiff(
-                            field_path=field_path,
-                            field_type=field_type,
-                            change_type="modified",
-                            original_value=original_value,
-                            new_value=new_value,
-                            confidence=confidences.modified,
-                        )
-                    )
-                elif new_value is not None:
-                    changes.append(
-                        ResumeFieldDiff(
-                            field_path=field_path,
-                            field_type=field_type,
-                            change_type="added",
-                            new_value=new_value,
-                            confidence=confidences.added,
-                        )
-                    )
-                elif original_value is not None:
-                    changes.append(
-                        ResumeFieldDiff(
-                            field_path=field_path,
-                            field_type=field_type,
-                            change_type="removed",
-                            original_value=original_value,
-                            confidence=confidences.removed,
-                        )
-                    )
+            )
 
 
 def calculate_resume_diff(
