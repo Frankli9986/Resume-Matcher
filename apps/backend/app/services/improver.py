@@ -1216,12 +1216,26 @@ def _tokenize_for_similarity(text: str) -> list[str]:
     return tokens
 
 
+def _normalize_source(text: str) -> str:
+    """NFKC + casefold the raw bullet text, *preserving* punctuation.
+
+    Used for exact-match detection: two bullets are exact only when their
+    normalized source strings are identical, NOT merely when their alnum token
+    lists match. Otherwise a punctuation-only edit like ``C++`` -> ``C#`` would
+    both tokenize to ``["c"]`` and be silently suppressed as an exact match
+    (cubic review finding on RM#905).
+    """
+    import unicodedata
+
+    return unicodedata.normalize("NFKC", text or "").casefold()
+
+
 @dataclass(frozen=True)
 class _BulletMatch:
     old_index: int
     new_index: int
     score: float
-    exact: bool  # True iff normalized token lists are identical.
+    exact: bool  # True iff normalized source strings are identical.
 
 
 def _match_bullets(
@@ -1237,6 +1251,10 @@ def _match_bullets(
     """
     old_tokens = [_tokenize_for_similarity(x) for x in original_items]
     new_tokens = [_tokenize_for_similarity(x) for x in improved_items]
+    # Normalized source strings (punctuation preserved) drive exact-match
+    # detection so punctuation-only edits (C++ -> C#) are not suppressed.
+    old_norm = [_normalize_source(x) for x in original_items]
+    new_norm = [_normalize_source(x) for x in improved_items]
 
     # Fast path: purely add/remove — nothing to match against.
     if not old_tokens or not new_tokens:
@@ -1247,13 +1265,23 @@ def _match_bullets(
     if max(len(old_tokens), len(new_tokens)) > _FUZZY_MATCH_LIMIT:
         matches: list[_BulletMatch] = []
         used_new: set[int] = set()
-        for i, left in enumerate(old_tokens):
-            for j, right in enumerate(new_tokens):
-                if j in used_new or left != right or not left:
-                    continue
-                matches.append(_BulletMatch(i, j, 1.0, True))
-                used_new.add(j)
-                break
+        # Index new items by normalized source so exact-anchor lookup is O(1)
+        # instead of O(n*m) (cubic review on RM#905): the previous double loop
+        # was quadratic even in this "fast" path. Only the first occurrence of
+        # each normalized key is anchorable; duplicates fall through to
+        # add/remove, which is correct for an exact-only backstop.
+        new_index_by_norm: dict[str, int] = {}
+        for j, norm in enumerate(new_norm):
+            if norm and norm not in new_index_by_norm:
+                new_index_by_norm[norm] = j
+        for i, norm in enumerate(old_norm):
+            if not norm:
+                continue
+            j = new_index_by_norm.get(norm)
+            if j is None or j in used_new:
+                continue
+            matches.append(_BulletMatch(i, j, 1.0, True))
+            used_new.add(j)
         return sorted(matches, key=lambda m: (m.new_index, m.old_index))
 
     # Score every candidate pair that clears the threshold. Empty token lists
@@ -1265,25 +1293,35 @@ def _match_bullets(
         for j, right in enumerate(new_tokens):
             if not right:
                 continue
-            if left == right:
+            if old_norm[i] == new_norm[j] and old_norm[i]:
+                # Identical normalized source (punctuation included) -> exact,
+                # i.e. a pure reorder or a no-op rewrite.
                 score = 1.0
                 exact = True
             else:
-                token_ratio = SequenceMatcher(
-                    None, left, right, autojunk=False
-                ).ratio()
-                # Char-level ratio catches single-word edits on short bullets
-                # ("Led team" -> "Led squad") that would otherwise score 0.5 on
-                # tokens and get dropped as unrelated. Use the normalized text
-                # so casing/whitespace don't distort it.
-                char_ratio = SequenceMatcher(
-                    None,
-                    " ".join(left),
-                    " ".join(right),
-                    autojunk=False,
-                ).ratio()
-                score = max(token_ratio, char_ratio)
                 exact = False
+                if left == right:
+                    # Tokens match but normalized source differs: a
+                    # punctuation-only edit such as "C++" -> "C#" (both
+                    # tokenize to ["c"]). A real content change - score 1.0 so
+                    # it pairs and emits as `modified`, not suppressed (cubic
+                    # review on RM#905).
+                    score = 1.0
+                else:
+                    token_ratio = SequenceMatcher(
+                        None, left, right, autojunk=False
+                    ).ratio()
+                    # Char-level ratio catches single-word edits on short
+                    # bullets ("Led team" -> "Led squad") that would otherwise
+                    # score 0.5 on tokens and get dropped as unrelated. Use the
+                    # normalized text so casing/whitespace don't distort it.
+                    char_ratio = SequenceMatcher(
+                        None,
+                        " ".join(left),
+                        " ".join(right),
+                        autojunk=False,
+                    ).ratio()
+                    score = max(token_ratio, char_ratio)
             if exact or score >= threshold:
                 # tuple: (-score, not exact, |i-j|, i, j) so sort() gives us
                 # highest score first, exact matches before fuzzy at same

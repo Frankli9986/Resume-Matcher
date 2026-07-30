@@ -330,6 +330,38 @@ def test_lcs_trap_unrelated_bullets_split_into_add_remove() -> None:
     assert not any(c.change_type == "modified" for c in changes)
 
 
+def test_punctuation_only_edit_is_not_suppressed() -> None:
+    # cubic review on RM#905: "C++" -> "C#" both tokenize to ["c"], so the old
+    # token-equality check treated them as exact and silently dropped the
+    # change. Exact must compare normalized SOURCE (punctuation preserved), so
+    # a punctuation-only edit lands as a real `modified`.
+    original = ["Built high-throughput services in C++"]
+    improved = ["Built high-throughput services in C#"]
+
+    changes = _describe("workExperience[0].description", original, improved)
+
+    assert [c.change_type for c in changes] == ["modified"]
+    assert "C++" in changes[0].original_value
+    assert "C#" in changes[0].new_value
+
+
+def test_punctuation_only_edit_in_fast_path_is_not_suppressed() -> None:
+    # Above the fuzzy backstop (>100 items) the fast path pairs on normalized
+    # SOURCE, not tokens, so a C++/C# swap must surface as add/remove instead
+    # of being silently exact-matched. Also exercises the O(n) index rewrite
+    # of the fast path (cubic #1 on RM#905).
+    original = [f"Item {i}" for i in range(120)] + ["Shipped C++ service"]
+    improved = [f"Item {i}" for i in range(120)] + ["Shipped C# service"]
+
+    changes = _describe("wp", original, improved)
+
+    assert sorted(c.change_type for c in changes) == ["added", "removed"]
+    removed = [c for c in changes if c.change_type == "removed"]
+    added = [c for c in changes if c.change_type == "added"]
+    assert "C++" in removed[0].original_value
+    assert "C#" in added[0].new_value
+
+
 def test_pure_reorder_produces_no_records_in_pr1() -> None:
     # PR-1 does not ship the `moved` enum: pure reorders must be silent so
     # the existing frontend does not receive an unknown change_type.
