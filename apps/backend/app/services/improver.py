@@ -1231,7 +1231,6 @@ def _normalize_source(text: str) -> str:
     consistent with the existing case/Unicode-compat-form equivalence
     (architect review finding on RM#905). Punctuation is intentionally kept.
     """
-    import re
     import unicodedata
 
     normalized = unicodedata.normalize("NFKC", text or "").casefold()
