@@ -4,6 +4,7 @@ import copy
 import json
 import logging
 import re
+from collections import deque
 from difflib import SequenceMatcher
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -1224,10 +1225,17 @@ def _normalize_source(text: str) -> str:
     lists match. Otherwise a punctuation-only edit like ``C++`` -> ``C#`` would
     both tokenize to ``["c"]`` and be silently suppressed as an exact match
     (cubic review finding on RM#905).
+
+    Whitespace runs are collapsed (and trimmed) so spacing-only differences
+    such as ``Led  team`` -> ``Led team`` do not register as content changes -
+    consistent with the existing case/Unicode-compat-form equivalence
+    (architect review finding on RM#905). Punctuation is intentionally kept.
     """
+    import re
     import unicodedata
 
-    return unicodedata.normalize("NFKC", text or "").casefold()
+    normalized = unicodedata.normalize("NFKC", text or "").casefold()
+    return re.sub(r"\s+", " ", normalized).strip()
 
 
 @dataclass(frozen=True)
@@ -1264,24 +1272,23 @@ def _match_bullets(
     # limit, keep only exact anchors. See _FUZZY_MATCH_LIMIT.
     if max(len(old_tokens), len(new_tokens)) > _FUZZY_MATCH_LIMIT:
         matches: list[_BulletMatch] = []
-        used_new: set[int] = set()
-        # Index new items by normalized source so exact-anchor lookup is O(1)
-        # instead of O(n*m) (cubic review on RM#905): the previous double loop
-        # was quadratic even in this "fast" path. Only the first occurrence of
-        # each normalized key is anchorable; duplicates fall through to
-        # add/remove, which is correct for an exact-only backstop.
-        new_index_by_norm: dict[str, int] = {}
+        # Index new items by normalized source as per-key deques so duplicate
+        # keys are consumed one-to-one in O(n+m) (architect review on RM#905):
+        # a previous dict[str,int] kept only the first index and mis-paired
+        # large duplicate lists (121 identical bullets -> 120 added + 120
+        # removed). Each new index lives in exactly one queue and is popped at
+        # most once, so pairing stays one-to-one without a used-set; only
+        # count-imbalanced duplicates fall through to add/remove.
+        new_queues_by_norm: dict[str, deque[int]] = {}
         for j, norm in enumerate(new_norm):
-            if norm and norm not in new_index_by_norm:
-                new_index_by_norm[norm] = j
+            if norm:
+                new_queues_by_norm.setdefault(norm, deque()).append(j)
         for i, norm in enumerate(old_norm):
-            if not norm:
+            queue = new_queues_by_norm.get(norm)
+            if not queue:
                 continue
-            j = new_index_by_norm.get(norm)
-            if j is None or j in used_new:
-                continue
+            j = queue.popleft()
             matches.append(_BulletMatch(i, j, 1.0, True))
-            used_new.add(j)
         return sorted(matches, key=lambda m: (m.new_index, m.old_index))
 
     # Score every candidate pair that clears the threshold. Empty token lists

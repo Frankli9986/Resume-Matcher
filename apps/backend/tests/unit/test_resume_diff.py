@@ -362,6 +362,34 @@ def test_punctuation_only_edit_in_fast_path_is_not_suppressed() -> None:
     assert "C#" in added[0].new_value
 
 
+def test_fast_path_consumes_duplicate_anchors_one_to_one() -> None:
+    # Architect review on RM#905: the fast path must consume duplicate
+    # normalized keys one-to-one (per-key queue), not keep only the first
+    # index. Otherwise an unchanged 121-item duplicate list would emit
+    # 120 `added` + 120 `removed`.
+    original = ["Wrote unit tests"] * 121
+    improved = ["Wrote unit tests"] * 121
+
+    assert _describe("wp", original, improved) == []
+
+    # Count imbalance: the one extra original duplicate falls through to
+    # `removed`; nothing else changes.
+    original = ["Wrote unit tests"] * 121
+    improved = ["Wrote unit tests"] * 120
+
+    changes = _describe("wp", original, improved)
+    assert [c.change_type for c in changes] == ["removed"]
+
+
+def test_whitespace_only_difference_is_not_a_content_change() -> None:
+    # Architect review on RM#905: _normalize_source folds whitespace so a
+    # spacing/case change is not reported as a content edit.
+    original = ["Led  team to deliver"]  # double space
+    improved = ["Led team to deliver"]   # single space
+
+    assert _describe("workExperience[0].description", original, improved) == []
+
+
 def test_pure_reorder_produces_no_records_in_pr1() -> None:
     # PR-1 does not ship the `moved` enum: pure reorders must be silent so
     # the existing frontend does not receive an unknown change_type.
