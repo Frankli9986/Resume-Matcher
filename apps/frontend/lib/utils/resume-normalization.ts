@@ -129,10 +129,13 @@ const normalizeCustomSection = (section: CustomSection): CustomSection => {
 export const normalizeResumeForSave = (resume: ResumeData): ResumeData => {
   const customSections = resume.customSections
     ? Object.fromEntries(
-        Object.entries(resume.customSections).map(([key, section]) => [
-          key,
-          normalizeCustomSection(section),
-        ])
+        Object.entries(resume.customSections)
+          .map(([key, section]) => [key, normalizeCustomSection(section)] as const)
+          // normalizeCustomSection returns null/primitive sections unchanged;
+          // dropping them here keeps them out of the PATCH payload, where they
+          // would fail backend CustomSection validation and crash consumers
+          // doing Object.entries(customSections) -> .sectionType.
+          .filter((entry): entry is readonly [string, CustomSection] => isObjectRecord(entry[1]))
       )
     : resume.customSections;
 

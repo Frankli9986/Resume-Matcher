@@ -246,6 +246,26 @@ describe('normalization robustness — sections and education', () => {
     ).not.toThrow();
   });
 
+  it('drops null and primitive customSections entries from the save payload', () => {
+    const out = normalizeResumeForSave(
+      malformed({
+        customSections: {
+          broken: null,
+          primitive: 'nope',
+          array: ['not', 'a', 'section'],
+          ok: { sectionType: 'stringList', strings: ['Real'] },
+        },
+      })
+    );
+
+    // Invalid entries must not reach the backend (CustomSection validation
+    // fails on them) nor crash consumers doing Object.entries -> .sectionType.
+    expect(out.customSections?.broken).toBeUndefined();
+    expect(out.customSections?.primitive).toBeUndefined();
+    expect(out.customSections?.array).toBeUndefined();
+    expect(out.customSections?.ok).toEqual({ sectionType: 'stringList', strings: ['Real'] });
+  });
+
   it('drops null and primitive education entries', () => {
     const out = normalizeResumeForSave(
       malformed({ education: [null, { id: 1, institution: 'MIT' }, 'nope'] })
