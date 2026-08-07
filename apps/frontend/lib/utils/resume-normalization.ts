@@ -32,20 +32,24 @@ const normalizeStringList = (items?: unknown): string[] | undefined => {
 const isObjectRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
-// Mirrors the backend `SectionType` enum (apps/backend/app/schemas/models.py):
-// CustomSection validation fails on any other value, so a persisted entry with
-// a missing or bogus sectionType must be dropped, not passed through.
-const CUSTOM_SECTION_TYPES: ReadonlySet<string> = new Set<SectionType>([
-  'personalInfo',
-  'text',
-  'itemList',
-  'stringList',
-]);
+// Exhaustive map keyed on the frontend `SectionType` union (which mirrors the
+// backend `SectionType` enum in apps/backend/app/schemas/models.py). A Record
+// keyed by SectionType makes TypeScript fail to compile if the union grows and
+// this map is not updated — so a new backend section type can never be silently
+// dropped from the save payload. CustomSection validation fails on any value
+// outside the union, so a persisted entry with a missing or bogus sectionType
+// must still be dropped, not passed through.
+const CUSTOM_SECTION_TYPES: Record<SectionType, true> = {
+  personalInfo: true,
+  text: true,
+  itemList: true,
+  stringList: true,
+};
 
 const isCustomSectionRecord = (value: unknown): value is CustomSection =>
   isObjectRecord(value) &&
   typeof value.sectionType === 'string' &&
-  CUSTOM_SECTION_TYPES.has(value.sectionType);
+  CUSTOM_SECTION_TYPES[value.sectionType as SectionType] === true;
 
 const normalizeDescriptionFields = <T extends DescribedItem>(item: T): T => {
   // A null element inside an otherwise-valid array throws on property access.

@@ -299,10 +299,12 @@ describe('normalization robustness — sections and education', () => {
     expect(out.customSections?.ok).toEqual({ sectionType: 'stringList', strings: ['Real'] });
   });
 
-  it('keeps valid itemList and stringList customSections with content intact', () => {
+  it('keeps every SectionType union member with content intact', () => {
     const out = normalizeResumeForSave(
       malformed({
         customSections: {
+          info: { sectionType: 'personalInfo', text: 'Header' },
+          text: { sectionType: 'text', text: 'Body' },
           item: {
             sectionType: 'itemList',
             items: [{ id: 1, title: 'A', description: ['', 'Kept'] }],
@@ -312,6 +314,8 @@ describe('normalization robustness — sections and education', () => {
       })
     );
 
+    expect(out.customSections?.info).toEqual({ sectionType: 'personalInfo', text: 'Header' });
+    expect(out.customSections?.text).toEqual({ sectionType: 'text', text: 'Body' });
     expect(out.customSections?.item).toEqual({
       sectionType: 'itemList',
       items: [{ id: 1, title: 'A', description: ['Kept'] }],
