@@ -4,6 +4,7 @@ import type {
   Experience,
   Project,
   ResumeData,
+  SectionType,
 } from '@/components/dashboard/resume-component';
 
 type DescribedItem = {
@@ -30,6 +31,21 @@ const normalizeStringList = (items?: unknown): string[] | undefined => {
 
 const isObjectRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
+
+// Mirrors the backend `SectionType` enum (apps/backend/app/schemas/models.py):
+// CustomSection validation fails on any other value, so a persisted entry with
+// a missing or bogus sectionType must be dropped, not passed through.
+const CUSTOM_SECTION_TYPES: ReadonlySet<string> = new Set<SectionType>([
+  'personalInfo',
+  'text',
+  'itemList',
+  'stringList',
+]);
+
+const isCustomSectionRecord = (value: unknown): value is CustomSection =>
+  isObjectRecord(value) &&
+  typeof value.sectionType === 'string' &&
+  CUSTOM_SECTION_TYPES.has(value.sectionType);
 
 const normalizeDescriptionFields = <T extends DescribedItem>(item: T): T => {
   // A null element inside an otherwise-valid array throws on property access.
@@ -134,8 +150,12 @@ export const normalizeResumeForSave = (resume: ResumeData): ResumeData => {
           // normalizeCustomSection returns null/primitive sections unchanged;
           // dropping them here keeps them out of the PATCH payload, where they
           // would fail backend CustomSection validation and crash consumers
-          // doing Object.entries(customSections) -> .sectionType.
-          .filter((entry): entry is readonly [string, CustomSection] => isObjectRecord(entry[1]))
+          // doing Object.entries(customSections) -> .sectionType. Object-ness
+          // alone is not enough — an entry must also carry a sectionType the
+          // backend schema actually accepts.
+          .filter((entry): entry is readonly [string, CustomSection] =>
+            isCustomSectionRecord(entry[1])
+          )
       )
     : resume.customSections;
 

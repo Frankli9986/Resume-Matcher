@@ -266,6 +266,62 @@ describe('normalization robustness — sections and education', () => {
     expect(out.customSections?.ok).toEqual({ sectionType: 'stringList', strings: ['Real'] });
   });
 
+  it('drops customSections entries whose sectionType is missing', () => {
+    const out = normalizeResumeForSave(
+      malformed({
+        customSections: {
+          noType: { foo: 'bar' },
+          empty: {},
+          ok: { sectionType: 'itemList', items: [{ id: 1, title: 'Real' }] },
+        },
+      })
+    );
+
+    expect(out.customSections?.noType).toBeUndefined();
+    expect(out.customSections?.empty).toBeUndefined();
+    expect(out.customSections?.ok).toEqual({
+      sectionType: 'itemList',
+      items: [{ id: 1, title: 'Real', description: [] }],
+    });
+  });
+
+  it('drops customSections entries with an invalid sectionType', () => {
+    const out = normalizeResumeForSave(
+      malformed({
+        customSections: {
+          bogus: { sectionType: 'bogus', items: [] },
+          ok: { sectionType: 'stringList', strings: ['Real'] },
+        },
+      })
+    );
+
+    expect(out.customSections?.bogus).toBeUndefined();
+    expect(out.customSections?.ok).toEqual({ sectionType: 'stringList', strings: ['Real'] });
+  });
+
+  it('keeps valid itemList and stringList customSections with content intact', () => {
+    const out = normalizeResumeForSave(
+      malformed({
+        customSections: {
+          item: {
+            sectionType: 'itemList',
+            items: [{ id: 1, title: 'A', description: ['', 'Kept'] }],
+          },
+          list: { sectionType: 'stringList', strings: ['One', '  Two  '] },
+        },
+      })
+    );
+
+    expect(out.customSections?.item).toEqual({
+      sectionType: 'itemList',
+      items: [{ id: 1, title: 'A', description: ['Kept'] }],
+    });
+    expect(out.customSections?.list).toEqual({
+      sectionType: 'stringList',
+      strings: ['One', 'Two'],
+    });
+  });
+
   it('drops null and primitive education entries', () => {
     const out = normalizeResumeForSave(
       malformed({ education: [null, { id: 1, institution: 'MIT' }, 'nope'] })
