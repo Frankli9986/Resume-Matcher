@@ -39,7 +39,7 @@ const isObjectRecord = (value: unknown): value is Record<string, unknown> =>
 // dropped from the save payload. CustomSection validation fails on any value
 // outside the union, so a persisted entry with a missing or bogus sectionType
 // must still be dropped, not passed through.
-const CUSTOM_SECTION_TYPES: Record<SectionType, true> = {
+const CUSTOM_SECTION_TYPES: Readonly<Record<SectionType, true>> = {
   personalInfo: true,
   text: true,
   itemList: true,
